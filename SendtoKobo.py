@@ -1,296 +1,450 @@
-import os
+import sys
+import time
 import subprocess
 import threading
 import socket
 import http.server
 import socketserver
-import urllib.request
-import sys
+from pathlib import Path
+from typing import Optional
+import shutil  # <--- thêm dòng này bên trên cùng các import khác
+import os
+import re
+import mimetypes
+import shutil
+from urllib.parse import quote
+from http import HTTPStatus
+
+
+from PyQt6 import QtGui
 from PyQt6.QtCore import QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QWidget, QFileDialog, QMessageBox
-from PyQt6 import QtGui
-from ui_SendFile import Ui_Form
+
+from ui_SendFile import Ui_Form  # UI sinh từ SendFile.ui
+
+# Gom plugin SVG khi bundle (icon folder có .svg)
+try:
+    from PyQt6.QtSvgWidgets import QSvgWidget  # noqa: F401
+except Exception:
+    pass
 
 PORT = 8080
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-KEPUBIFY_PATH = os.path.join(SCRIPT_DIR, "kepubify-windows-64bit.exe")
-EBOOK_EXTENSIONS = [".epub", ".kepub.epub", ".pdf", ".mobi", ".azw3"]
 
-def get_local_ip():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except:
-        return "localhost"
 
-class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
-    # (Không có thay đổi ở class này)
-    def list_directory(self, path):
-        try:
-            entries = os.listdir(path)
-        except OSError:
-            self.send_error(404, "No permission to list directory")
-            return None
+def resource_path(rel: str) -> str:
+    base = getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)
+    return str(Path(base) / rel)
 
-        entries.sort(key=lambda a: a.lower())
-        r = []
-        displaypath = os.path.relpath(path, os.getcwd())
-        enc = 'utf-8'
-        r.append(f'<html><head><meta charset="{enc}"><title>Index of {displaypath}</title></head>')
-        r.append(f'<body><h2>Index of {displaypath}</h2><hr><ul>')
-        for name in entries:
-            fullname = os.path.join(path, name)
-            displayname = name
-            if os.path.isdir(fullname):
-                displayname = name + "/"
-            elif not any(name.endswith(ext) for ext in EBOOK_EXTENSIONS):
-                continue
-            r.append(f'<li><a href="{displayname}">{displayname}</a></li>')
-        r.append('</ul><hr></body></html>')
-        encoded = '\n'.join(r).encode(enc, 'surrogateescape')
-        f = self.wfile
-        self.send_response(200)
-        self.send_header("Content-Type", f"text/html; charset={enc}")
-        self.send_header("Content-Length", str(len(encoded)))
+
+KEPUBIFY_PATH = resource_path("kepubify-windows-64bit.exe")
+
+
+class RangeDownloadHandler(http.server.SimpleHTTPRequestHandler):
+    """
+    Handler phục vụ file có hỗ trợ Range, gửi Content-Length chính xác,
+    Connection: close và Content-Disposition: attachment.
+    """
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args, **kwargs):
+        pass  # giữ yên tĩnh
+
+    def guess_type(self, path):
+        ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        # EPUB/KEPUB
+        if path.lower().endswith((".epub", ".kepub.epub")):
+            ctype = "application/epub+zip"
+        return ctype
+
+    def _send_file_with_range(self, path, is_head=False):
+        if not os.path.isfile(path):
+            self.send_error(HTTPStatus.NOT_FOUND, "File not found")
+            return
+
+        ctype = self.guess_type(path)
+        fs = os.stat(path)
+        size = fs.st_size
+        start, end = 0, size - 1
+
+        # Parse Range header (nếu có)
+        rng = self.headers.get("Range")
+        if rng:
+            m = re.match(r"bytes=(\d*)-(\d*)", rng)
+            if m:
+                if m.group(1):
+                    start = int(m.group(1))
+                if m.group(2):
+                    end = int(m.group(2)) if m.group(2) else end
+                if start > end or start >= size:
+                    self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                    return
+                self.send_response(HTTPStatus.PARTIAL_CONTENT)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            else:
+                # Range header không hợp lệ -> trả full
+                self.send_response(HTTPStatus.OK)
+        else:
+            self.send_response(HTTPStatus.OK)
+
+        length = end - start + 1
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        # Ép tải xuống và hỗ trợ tên Unicode
+        filename = os.path.basename(path)
+        self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(filename)}")
+        # Đảm bảo client kết thúc phiên sau response
+        self.send_header("Connection", "close")
         self.end_headers()
-        f.write(encoded)
-        return None
+
+        if is_head:
+            return
+
+        # Gửi chính xác 'length' byte, rồi flush
+        with open(path, "rb") as f:
+            f.seek(start)
+            remaining = length
+            bufsize = 64 * 1024
+            while remaining > 0:
+                chunk = f.read(min(bufsize, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
+            try:
+                self.wfile.flush()
+                # Thêm dòng này: Gửi tín hiệu kết thúc việc ghi dữ liệu (FIN packet)
+                self.connection.shutdown(socket.SHUT_WR)
+            except (socket.error, BrokenPipeError, ConnectionResetError):
+                # Lỗi này là bình thường nếu client tự đóng kết nối trước
+                pass
+            except Exception:
+                # Các lỗi khác nếu có
+                pass
+        # Đóng kết nối ở phía server
+        self.close_connection = True
+
+    # Nếu là thư mục, dùng xử lý mặc định (trả HTML listing)
+    def do_GET(self):
+        path = self.translate_path(self.path)
+        if os.path.isdir(path):
+            return super().do_GET()
+        return self._send_file_with_range(path, is_head=False)
+
+    def do_HEAD(self):
+        path = self.translate_path(self.path)
+        if os.path.isdir(path):
+            return super().do_HEAD()
+        return self._send_file_with_range(path, is_head=True)
+
+
+class ReusableThreadingServer(http.server.ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
 
 class SendToKobo(QWidget):
-    server_shutdown_finished = pyqtSignal()
+    log_signal = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
         self.ui = Ui_Form()
         self.ui.setupUi(self)
 
-        self.is_processing = False
-        self.start_icon = QtGui.QIcon("icons/file_1119057.png")
-        self.stop_icon = QtGui.QIcon("icons/cancel_4308034.png")
-        self.ui.pushButton_Send.setIcon(self.start_icon)
-        
-        # --- THÊM MỚI: Các biến cho hoạt cảnh ---
-        self.animation_timer = QTimer(self)
-        self.animation_timer.setInterval(150)  # Tốc độ animation
-        self.animation_timer.timeout.connect(self.update_log_animation)
-        self.animation_chars = ["/", "-", "\\", "|"]
-        self.animation_index = 0
-        self.animated_log_item = None  # Lưu mục log đang được tạo hoạt cảnh
-        # --- KẾT THÚC PHẦN THÊM MỚI ---
-        
-        self.ui.pushButton_SourceFolder.clicked.connect(self.select_source_folder)
-        self.ui.pushButton_2.clicked.connect(self.select_destination_folder)
-        self.ui.pushButton_Send.clicked.connect(self.toggle_process)
-        self.ui.checkBox_Convert.stateChanged.connect(self.toggle_destination_enabled)
-        
-        self.server_shutdown_finished.connect(self.on_shutdown_finished)
+        # ----- state -----
+        self.state = "idle"  # idle | processing | serving | stopping
+        self.cancel_event = threading.Event()
+        self.worker_thread: Optional[threading.Thread] = None
+        self.httpd: Optional[ReusableThreadingServer] = None
+        self.server_thread: Optional[threading.Thread] = None
+        self.local_ip = self._get_local_ip()
 
-        self.local_ip = get_local_ip()
-        self.toggle_destination_enabled()
-        self.httpd = None
-        self.server_thread = None
-        self.log(f"🚀 Gợi ý: Nhập địa chỉ IP trên Kobo/thiết bị: http://{self.local_ip}:{PORT}")
+        # ----- wire UI -----
+        self.ui.pushButton_SourceFolder.clicked.connect(self.choose_source)
+        self.ui.pushButton_2.clicked.connect(self.choose_dest)
+        self.ui.pushButton_Send.clicked.connect(self.on_send_clicked)
+        self.ui.checkBox_Convert.toggled.connect(self.on_convert_toggle)
 
-    # --- THÊM MỚI: Hàm để cập nhật hoạt cảnh ---
-    def update_log_animation(self):
-        if self.animated_log_item:
-            char = self.animation_chars[self.animation_index]
-            self.animated_log_item.setText(f"⏳ Đang dừng server, vui lòng chờ... {char}")
-            self.animation_index = (self.animation_index + 1) % len(self.animation_chars)
+        # ----- icons -----
+        self._init_icons()
+        self._update_button_icon()
+        self.on_convert_toggle(self.ui.checkBox_Convert.isChecked())
 
-    def closeEvent(self, event):
-        # (Không có thay đổi ở hàm này)
-        if self.is_processing and self.httpd:
-             reply = QMessageBox.question(self, 'Thoát chương trình',
-                                     "Server đang chạy. Bạn có chắc muốn tắt server và thoát?", 
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        else:
-            reply = QMessageBox.question(self, 'Thoát chương trình',
-                                     "Bạn có chắc muốn thoát?", 
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-
-        if reply == QMessageBox.StandardButton.Yes:
-            if self.is_processing and self.httpd:
-                self.shutdown_server() 
-            event.accept()
-        else:
-            event.ignore()
-            
-    def toggle_process(self):
-        # (Không có thay đổi ở hàm này)
-        if self.is_processing:
-            self.stop_process()
-        else:
-            self.start_process()
-
-    def stop_process(self):
-        # (Không có thay đổi ở hàm này)
-        if self.httpd:
-            reply = QMessageBox.question(self, 'Dừng Server',
-                                         "Bạn có chắc muốn dừng server chia sẻ file?",
-                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            if reply == QMessageBox.StandardButton.Yes:
-                self.shutdown_server()
-        else:
-            QMessageBox.information(self, "Thông báo", "Đang trong quá trình convert, không thể dừng lúc này.")
-
-    # --- THAY ĐỔI: Hàm on_shutdown_finished sẽ dừng hoạt cảnh ---
-    def on_shutdown_finished(self):
-        self.animation_timer.stop()
-        if self.animated_log_item:
-            self.animated_log_item.setText("✅ Server đã dừng hoàn toàn.")
-            self.animated_log_item = None
-        
-        self.httpd = None
-        self.is_processing = False
-        self.ui.pushButton_Send.setIcon(self.start_icon)
-        self.ui.pushButton_Send.setEnabled(True)
+        # ----- log/progress -----
+        self.log_signal.connect(self._append_log)
+        self.ui.progressBar.setRange(0, 100)
         self.ui.progressBar.setValue(0)
 
-    # --- THAY ĐỔI: Hàm shutdown_server sẽ bắt đầu hoạt cảnh ---
-    def shutdown_server(self):
-        if not self.httpd:
-            return
+        self.timer = QTimer(self)
+        self.timer.setInterval(1000)
+        self.timer.timeout.connect(lambda: None)
+        self.timer.start()
 
-        # Bắt đầu hoạt cảnh thay vì ghi log tĩnh
-        self.log("") # Thêm một mục trống để bắt đầu animation
-        self.animated_log_item = self.ui.listWidget_Log.item(self.ui.listWidget_Log.count() - 1)
-        self.animation_index = 0
-        self.animation_timer.start()
+    # ========== ICON ==========
+    def _init_icons(self):
+        self.icon_send = QtGui.QIcon(resource_path('icons/file_1119057.png'))
+        self.icon_cancel = QtGui.QIcon(resource_path('icons/cancel_4308034.png'))
+        self.icon_folder = QtGui.QIcon(resource_path('icons/flat-color-icons--folder.svg'))
+        try:
+            self.setWindowIcon(self.icon_send)
+        except Exception:
+            pass
+        self.ui.pushButton_SourceFolder.setIcon(self.icon_folder)
+        self.ui.pushButton_2.setIcon(self.icon_folder)
+        self.ui.pushButton_Send.setIcon(self.icon_send)
+        # Xóa text – chỉ dùng PNG
+        self.ui.pushButton_Send.setText("")
+        for name in ('pushButton_Big', 'toolButton_Big', 'pushButton', 'toolButton'):
+            w = getattr(self.ui, name, None)
+            if w:
+                w.setIcon(self.icon_send)
+                try:
+                    w.setText("")
+                except Exception:
+                    pass
 
-        self.ui.pushButton_Send.setEnabled(False)
+    def _update_button_icon(self):
+        """Chỉ đổi icon theo state (không đặt text)."""
+        if self.state in ("processing", "serving", "stopping"):
+            self.ui.pushButton_Send.setIcon(self.icon_cancel)
+        else:
+            self.ui.pushButton_Send.setIcon(self.icon_send)
+        for name in ('pushButton_Big', 'toolButton_Big', 'pushButton', 'toolButton'):
+            w = getattr(self.ui, name, None)
+            if w:
+                w.setIcon(self.icon_cancel if self.state in ("processing", "serving", "stopping") else self.icon_send)
 
-        def shutdown_task():
-            try:
-                self.httpd.shutdown()
-                self.httpd.server_close()
-            except Exception as e:
-                self.log(f"❌ Lỗi khi tắt server: {e}")
-            finally:
-                self.server_shutdown_finished.emit()
+    # ========== LOG ==========
+    def _append_log(self, text: str):
+        self.ui.listWidget_Log.addItem(text)
+        self.ui.listWidget_Log.scrollToBottom()
 
-        threading.Thread(target=shutdown_task, daemon=True).start()
+    def log(self, text: str):
+        self.log_signal.emit(text)
 
-        def dummy_request_task():
-            try:
-                urllib.request.urlopen(f"http://{self.local_ip}:{PORT}", timeout=1)
-            except Exception:
-                pass
+    # ========== BUSY UI ==========
+    def _set_busy(self, busy: bool):
+        """Hiển thị progress bar ‘indeterminate’ khi busy=True."""
+        if busy:
+            self.ui.progressBar.setRange(0, 0)
+            self.ui.pushButton_Send.setEnabled(False)
+        else:
+            self.ui.progressBar.setRange(0, 100)
+            self.ui.pushButton_Send.setEnabled(True)
 
-        threading.Thread(target=dummy_request_task, daemon=True).start()
+    # ========== DEST enable ==========
+    def on_convert_toggle(self, checked: bool):
+        self.ui.lineEdit_Destination.setEnabled(checked)
+        self.ui.pushButton_2.setEnabled(checked)
 
-    def log(self, message):
-        # (Không có thay đổi ở hàm này)
-        self.ui.listWidget_Log.addItem(message)
-        self.ui.listWidget_Log.setCurrentRow(-1)
-        QTimer.singleShot(0, self.ui.listWidget_Log.scrollToBottom)
+    # ========== browse ==========
+    def choose_source(self):
+        path = QFileDialog.getExistingDirectory(self, 'Chọn thư mục nguồn')
+        if path:
+            self.ui.lineEdit_SourceFolder.setText(path)
 
-    def toggle_destination_enabled(self):
-        # (Không có thay đổi ở hàm này)
-        enabled = self.ui.checkBox_Convert.isChecked()
-        self.ui.lineEdit_Destination.setEnabled(enabled)
-        self.ui.pushButton_2.setEnabled(enabled)
+    def choose_dest(self):
+        path = QFileDialog.getExistingDirectory(self, 'Chọn thư mục đích')
+        if path:
+            self.ui.lineEdit_Destination.setText(path)
 
-    def select_source_folder(self):
-        # (Không có thay đổi ở hàm này)
-        folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục nguồn")
-        if folder:
-            self.ui.lineEdit_SourceFolder.setText(folder)
+    # ========== network ==========
+    def _get_local_ip(self) -> str:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "127.0.0.1"
 
-    def select_destination_folder(self):
-        # (Không có thay đổi ở hàm này)
-        folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục chia sẻ")
-        if folder:
-            self.ui.lineEdit_Destination.setText(folder)
-
-    def convert_epub_to_kepub(self, source_folder, output_folder):
-        # (Không có thay đổi ở hàm này)
-        if not os.path.exists(KEPUBIFY_PATH):
-            QMessageBox.critical(self, "Thiếu file", f"Không tìm thấy kepubify-windows-64bit.exe trong thư mục:\n{SCRIPT_DIR}\nVui lòng tải và đặt vào đúng thư mục.")
-            return False
-
-        files = [f for f in os.listdir(source_folder) if f.endswith(".epub") and not f.endswith(".kepub.epub")]
-        total = len(files)
-        
-        creation_flags = 0
-        if sys.platform == "win32":
-            creation_flags = subprocess.CREATE_NO_WINDOW
-            
-        for i, filename in enumerate(files, start=1):
-            epub_path = os.path.join(source_folder, filename)
-            output_file = os.path.join(output_folder, filename.replace(".epub", ".kepub.epub"))
-            self.log(f"🔄 Converting: {filename}")
-            subprocess.run([KEPUBIFY_PATH, epub_path, "--output", output_file], creationflags=creation_flags)
-            self.ui.progressBar.setValue(int(i / total * 100))
-            
-        self.log("✅ Hoàn tất chuyển đổi.")
-        return True
-
-    def start_server(self, directory):
-        # (Không có thay đổi ở hàm này)
+    def start_server(self, folder: Path):
         if self.httpd:
-            self.log("⚠️ Server đã đang chạy rồi.")
             return
-            
-        os.chdir(directory)
-        self.log(f"📁 Thư mục chia sẻ: {directory}")
-        self.httpd = socketserver.TCPServer(("", PORT), CustomHTTPRequestHandler)
+        handler = lambda *a, directory=str(folder): RangeDownloadHandler(*a, directory=directory)
+        self.httpd = ReusableThreadingServer(("", PORT), handler)
         self.server_thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.server_thread.start()
-        self.log(f"✅ Server running: http://{self.local_ip}:{PORT}")
-        self.is_processing = True
-        self.ui.pushButton_Send.setIcon(self.stop_icon)
+        self.state = "serving"
+        self._update_button_icon()
+        self.log(f'🌐 Đã bật chia sẻ: http://{self.local_ip}:{PORT}/')
 
-    def run(self):
-        # (Không có thay đổi ở hàm này)
-        self.show()
 
-    def start_process(self):
-        # (Không có thay đổi ở hàm này)
-        self.is_processing = True
-        self.ui.pushButton_Send.setIcon(self.stop_icon)
-        
-        self.log("⏳ Bắt đầu xử lý, vui lòng chờ...")
-        
-        source_folder = self.ui.lineEdit_SourceFolder.text()
-        destination_folder = self.ui.lineEdit_Destination.text()
-        convert_enabled = self.ui.checkBox_Convert.isChecked()
+    def stop_server_async(self, notify: bool = True):
+        """Tắt server dưới thread riêng, có animation & log mượt."""
+        if not self.httpd:
+            return
+        if notify:
+            self.log('⏹ Đang tắt chia sẻ… (đang đóng cổng)')
+        self.state = "stopping"
+        self._update_button_icon()
+        self._set_busy(True)
 
-        if not os.path.exists(source_folder):
-            self.log("❌ Thư mục nguồn không tồn tại.")
-            self.is_processing = False
-            self.ui.pushButton_Send.setIcon(self.start_icon)
+        def _do_stop():
+            try:
+                try:
+                    self.httpd.shutdown()
+                finally:
+                    self.httpd.server_close()
+            except Exception as e:
+                self.log(f'⚠️ Lỗi khi tắt server: {e}')
+            finally:
+                if self.server_thread:
+                    self.server_thread.join(timeout=2.0)
+                self.httpd = None
+                self.server_thread = None
+                # Đảm bảo người dùng thấy animation tối thiểu
+                time.sleep(0.35)
+                self._set_busy(False)
+                self.state = "idle"
+                self._update_button_icon()
+                if notify:
+                    self.log('✅ Đã tắt chia sẻ.')
+
+        threading.Thread(target=_do_stop, daemon=True).start()
+
+    def stop_server_blocking(self, notify: bool = False):
+        """Tắt server và chờ hoàn tất (dùng khi thoát ứng dụng)."""
+        if not self.httpd:
+            return
+        if notify:
+            self.log('⏹ Đang tắt chia sẻ…')
+        try:
+            try:
+                self.httpd.shutdown()
+            finally:
+                self.httpd.server_close()
+        except Exception as e:
+            self.log(f'⚠️ Lỗi khi tắt server: {e}')
+        finally:
+            if self.server_thread:
+                self.server_thread.join(timeout=2.0)
+            self.httpd = None
+            self.server_thread = None
+            self.state = "idle"
+            self._update_button_icon()
+            if notify:
+                self.log('✅ Đã tắt chia sẻ.')
+
+    # ========== convert ==========
+    def _convert_folder(self, src: Path, dst: Path) -> int:
+        if not Path(KEPUBIFY_PATH).exists():
+            raise FileNotFoundError(f'Không tìm thấy kepubify: {KEPUBIFY_PATH}')
+        dst.mkdir(parents=True, exist_ok=True)
+        files = [p for p in src.glob('*.epub')
+                 if p.is_file() and not p.name.lower().endswith('.kepub.epub')]
+        total = len(files)
+        count = 0
+        for i, p in enumerate(files, start=1):
+            if self.cancel_event.is_set():
+                self.log('⏹ Đã huỷ theo yêu cầu.')
+                break
+            try:
+                out = dst / (p.stem + '.kepub.epub')
+                cmd = [KEPUBIFY_PATH, str(p), '-o', str(out)]
+                creationflags = 0x08000000  # CREATE_NO_WINDOW
+                cp = subprocess.run(
+                    cmd, creationflags=creationflags,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding='utf-8', errors='ignore'
+                )
+                if cp.returncode == 0 and out.exists():
+                    count += 1
+                    self.log(f'✅ {p.name} → {out.name}')
+                else:
+                    self.log(f'⚠️ Lỗi chuyển {p.name}: {cp.stdout[-400:]}')
+            except Exception as e:
+                self.log(f'❌ Lỗi {p.name}: {e}')
+            finally:
+                if total:
+                    self.ui.progressBar.setValue(int(i * 100 / total))
+        return count
+
+    # ========== action ==========
+    def on_send_clicked(self):
+        # đang convert → Stop = huỷ
+        if self.state == "processing":
+            self.cancel_event.set()
+            self.log("⏳ Đang huỷ tác vụ chuyển đổi...")
+            return
+        # đang share → Stop = tắt server
+        if self.state == "serving":
+            self.stop_server_async(notify=True)
+            return
+        if self.state == "stopping":
+            return  # đang tắt, bỏ qua click
+
+        # idle → bắt đầu tác vụ mới
+        src = Path(self.ui.lineEdit_SourceFolder.text().strip())
+        if not src.exists():
+            QMessageBox.warning(self, 'Thiếu thư mục', 'Chưa chọn thư mục nguồn hoặc không tồn tại.')
             return
 
-        if convert_enabled and not os.path.exists(destination_folder):
-            self.log("❌ Thư mục đích không tồn tại.")
-            self.is_processing = False
-            self.ui.pushButton_Send.setIcon(self.start_icon)
+        if not self.ui.checkBox_Convert.isChecked():
+            self.ui.progressBar.setValue(0)
+            self.start_server(src)
             return
 
-        server_folder = destination_folder if convert_enabled else source_folder
+        dst_text = self.ui.lineEdit_Destination.text().strip()
+        if not dst_text:
+            QMessageBox.warning(self, 'Thiếu thư mục', 'Chưa chọn thư mục đích.')
+            return
+        dst = Path(dst_text)
+
+        self.cancel_event.clear()
+        self.state = "processing"
+        self._update_button_icon()
+        self.ui.progressBar.setValue(5)
+        self.log('🔄 Đang chuyển đổi EPUB → KEPUB...')
 
         def task():
-            self.ui.progressBar.setValue(0)
-            if convert_enabled:
-                success = self.convert_epub_to_kepub(source_folder, destination_folder)
-                if not success:
-                    self.is_processing = False
-                    self.ui.pushButton_Send.setIcon(self.start_icon)
-                    return
-            self.ui.progressBar.setValue(100)
-            self.log("✅ Sẵn sàng chia sẻ.")
-            self.log(f"🚀 Truy cập: http://{self.local_ip}:{PORT}")
-            self.start_server(server_folder)
+            try:
+                n = self._convert_folder(src, dst)
+                if not self.cancel_event.is_set():
+                    if n == 0:
+                        self.log('ℹ️ Không có tệp .epub nào cần chuyển đổi (hoặc tất cả đã là .kepub.epub).')
+                    else:
+                        self.log(f'✅ Hoàn tất chuyển {n} tệp.')
+                    self.ui.progressBar.setValue(100)
+                    self.start_server(dst)
+            except FileNotFoundError as e:
+                self.log(str(e))
+                QMessageBox.critical(self, 'Thiếu công cụ',
+                                     f'{e}\nHãy chắc rằng file kepubify nằm cạnh SendToKobo.exe')
+                self.state = "idle"
+                self._update_button_icon()
+            except Exception as e:
+                self.log(f'Lỗi: {e}')
+                self.state = "idle"
+                self._update_button_icon()
+            finally:
+                if self.cancel_event.is_set():
+                    self.state = "idle"
+                    self._update_button_icon()
+                self.cancel_event.clear()
 
-        threading.Thread(target=task, daemon=True).start()
+        self.worker_thread = threading.Thread(target=task, daemon=True)
+        self.worker_thread.start()
+
+    # ========== lifecycle ==========
+    def closeEvent(self, event):
+        try:
+            self.cancel_event.set()
+            self.stop_server_blocking(notify=True)
+        finally:
+            event.accept()
+
 
 if __name__ == '__main__':
-    # (Không có thay đổi ở đây)
-    app = QApplication(sys.argv)
-    window = SendToKobo()
-    window.run()
-    sys.exit(app.exec())
+    # Safety harness: thông báo nếu lỗi khởi chạy
+    from PyQt6.QtWidgets import QMessageBox
+    import traceback
+    try:
+        app = QApplication(sys.argv)
+        w = SendToKobo()
+        w.show()
+        sys.exit(app.exec())
+    except Exception as e:
+        QMessageBox.critical(None, "Lỗi khởi chạy",
+                             f"{e}\n\n{traceback.format_exc()}")
+        raise
