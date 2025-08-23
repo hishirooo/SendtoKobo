@@ -3,8 +3,9 @@
 
 > **Công cụ chuyển đổi và gửi sách EPUB sang máy đọc sách Kobo qua WiFi**
 
-![SendtoKobo Banner](https://i.imgur.com/hYI1ZnU.png)  
-*(Bạn có thể thêm hình ảnh chụp màn hình chương trình tại đây nếu muốn)*
+<img width="486" height="502" alt="image" src="https://github.com/user-attachments/assets/b049aba9-af3a-4a94-8c9f-2d92f952de4d" />
+<img width="716" height="582" alt="image" src="https://github.com/user-attachments/assets/d23cb910-a187-4383-8d6c-e61ef4f1ffb8" />
+
 
 ---
 
